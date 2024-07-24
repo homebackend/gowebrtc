@@ -163,8 +163,8 @@ func main() {
 
 		router := gin.Default()
 		router.Static("/", htmldir)
-		router.POST("/stream", createStream(config, &streaming, &pid))
-		router.DELETE("/stream", deleteStream(&streaming, &pid))
+		router.POST(config.Url, createStream(config, &streaming, &pid))
+		router.DELETE(config.Url, deleteStream(&streaming, &pid))
 		router.Run(fmt.Sprintf("0.0.0.0:%d", config.Port))
 	} else if executeCommand.Happened() {
 		startExecuting(*v, *a, *s)
