@@ -1,0 +1,8 @@
+port: 8080
+url: /stream
+image_width: 640
+image_height: 480
+framerate: 30
+log_file: /var/log/gowebrtc.log
+audio_device: alsasrc device=plughw:CARD=I930,DEV=0
+video_device: autovideosrc

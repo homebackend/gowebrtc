@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset='utf-8'>
+    <meta http-equiv='X-UA-Compatible' content='IE=edge'>
+    <title>WebRTC</title>
+    <meta name='viewport' content='width=device-width, initial-scale=1'>
+    <link rel='stylesheet' type='text/css' media='screen' href='main.css'>
+    
+</head>
+<body>
+    <button id="start-session" onclick="window.startSession()"> Start Session </button>
+    <button id="stop-session" onclick="window.stopSession()" disabled> Stop Session </button>
+    <button id="reload-session" onclick="location.reload()" disabled> Reload Page </button>
+    <br />
+    
+    <br />
+    
+    Video<br />
+    <div id="remoteVideos">
+       <video class="video-player" id="video-player" autoplay playsinline></video>
+    </div> <br />
+    
+    Logs<br />
+    <div id="div"></div>
+    
+    
+</body>
+<script src='main.js'></script>
+</html>

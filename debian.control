@@ -1,0 +1,6 @@
+Package: gowebrtc
+Version: 0.1.0
+Maintainer: Neeraj Jakhar
+Architecture: all
+Description: Service to setup webrtc streaming
+Depends: libgstreamer1.0-dev, libgstreamer-plugins-base1.0-dev, gstreamer1.0-plugins-good, gstreamer1.0-alsa
