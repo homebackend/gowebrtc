@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset='utf-8'>
+    <meta http-equiv='X-UA-Compatible' content='IE=edge'>
+    <title>WebRTC</title>
+    <meta name='viewport' content='width=device-width, initial-scale=1'>
+    <link rel='stylesheet' type='text/css' media='screen' href='main.css'>
+    
+</head>
+<body>
+    Welcome to Gowebrtc Web interface. This is to demo Gowebrtc video streaming facility using Open Relay as ICE Server.<br/>
+
+    If you don't have an account on Open Relay, please follow instruction given <a href="https://www.metered.ca/tools/openrelay/" target="_blank">here</a> to create free account.<br />
+
+    One you have created account and application and have the Application Name and API Key ready, fill the details below and click <b>Test Open Relay</b>. Then click <b>Start Session</b> to start video streaming.<br />
+
+    <table>
+    <tr>
+        <th>Application Name:</th>
+        <td><input type="text" id="app-name" /></td>
+    </tr>
+    <tr>
+        <th>API Key:</th>
+        <td><input type="text" id="api-key" /></td>
+    </tr>
+    <tr>
+        <td colspan="2"><input type="submit" id="test-open-relay" onclick="window.init()" value="Test Open Relay" /></td>
+    </tr>
+    </table>
+
+    <br />
+    <br />
+
+    <button id="start-session" onclick="window.startSession()" disabled> Start Session </button>
+    <button id="stop-session" onclick="window.stopSession()" disabled> Stop Session </button>
+    <button id="reload-session" onclick="location.reload()" disabled> Reload Page </button>
+    <br />
+    
+    <br />
+    
+    Video<br />
+    <div id="remoteVideos">
+       <video class="video-player" id="video-player" autoplay playsinline></video>
+    </div> <br />
+    
+    Logs<br />
+    <div id="div"></div>
+    
+    
+</body>
+<script src='main-open-relay.js'></script>
+</html>

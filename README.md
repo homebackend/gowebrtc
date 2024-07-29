@@ -28,6 +28,29 @@ framerate: 30
 log_file: /var/log/gowebrtc.log
 audio_device: alsasrc device=plughw:CARD=I930,DEV=0
 video_device: autovideosrc
+open_relay_config:
+  app_name: <app-name>
+  api_key: <api-key>
+ice_servers:
+  - urls:
+    - "stun:stun.relay.metered.ca:80"
+  - urls:
+    - "turn:global.relay.metered.ca:80"
+    username: <username>
+    credential: <password>
+  - urls:
+    - "turn:global.relay.metered.ca:80?transport=tcp"
+    username: <username>
+    credential: <password>
+  - urls:
+    - "turn:global.relay.metered.ca:443"
+    username: <username>
+    credential: <password>
+  - urls:
+    - "turns:global.relay.metered.ca:443?transport=tcp"
+    username: <username>
+    credential: <password>
+
 ```
 # Running and Enabling Service
 `sudo systemctl start gowebrtc` will start the service.

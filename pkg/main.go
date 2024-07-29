@@ -53,15 +53,29 @@ type Response struct {
 	SDP string `json:"sdp"`
 }
 
+type OpenRelay struct {
+	AppName string `yaml:"app_name"`
+	ApiKey  string `yaml:"api_key"`
+}
+
+type ICEServer struct {
+	URLs           string                   `json:"urls"`
+	Username       string                   `json:"username,omitempty"`
+	Credential     interface{}              `json:"credential,omitempty"`
+	CredentialType webrtc.ICECredentialType `json:"credentialType,omitempty"`
+}
+
 type Configuration struct {
-	Port        int    `yaml:"port" validate:"number,gte=1,lte=65535" default:"8080"`
-	Url         string `yaml:"url" default:"/stream"`
-	ImageWidth  uint   `yaml:"image_width" default:"640"`
-	ImageHeight uint   `yaml:"image_height" default:"480"`
-	FrameRate   uint   `yaml:"framerate" default:"30"`
-	LogFile     string `yaml:"log_file" default:"none"`
-	AudioDevice string `yaml:"audio_device" validate:"required"`
-	VideoDevice string `yaml:"video_device" validate:"required"`
+	Port            int                `yaml:"port" validate:"number,gte=1,lte=65535" default:"8080"`
+	Url             string             `yaml:"url" default:"/stream"`
+	ImageWidth      uint               `yaml:"image_width" default:"640"`
+	ImageHeight     uint               `yaml:"image_height" default:"480"`
+	FrameRate       uint               `yaml:"framerate" default:"30"`
+	LogFile         string             `yaml:"log_file" default:"none"`
+	AudioDevice     string             `yaml:"audio_device" validate:"required"`
+	VideoDevice     string             `yaml:"video_device" validate:"required"`
+	IceServers      []webrtc.ICEServer `yaml:"ice_servers,omitempty"`
+	OpenRelayConfig *OpenRelay         `yaml:"open_relay_config,omitempty"`
 }
 
 // Encode encodes the input in base64
@@ -86,35 +100,13 @@ func decode(in string, obj interface{}) {
 	}
 }
 
-func mustReadStdin() string {
-	r := bufio.NewReader(os.Stdin)
-
-	var in string
-	for {
-		var err error
-		in, err = r.ReadString('\n')
-		if err != io.EOF {
-			if err != nil {
-				log.Fatalln(err)
-			}
-		}
-		in = strings.TrimSpace(in)
-		if len(in) > 0 {
-			break
-		}
-	}
-
-	fmt.Printf("Stdin: %s\n", in)
-	return in
-}
-
 func main() {
 	parser := argparse.NewParser(os.Args[0], "Setup Webrtc for video streaming from local camera")
 
 	serverCommand := parser.NewCommand("server", "Start webrtc service")
 	executeCommand := parser.NewCommand("execute", "Execute webrtc streaming")
 
-	c := serverCommand.String("c", "configuration-file", &argparse.Options{
+	c := parser.String("c", "configuration-file", &argparse.Options{
 		Required: false,
 		Default:  CONF_FILE,
 		Help:     "Configuration File",
@@ -141,8 +133,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	config := homecommon.GetConf[Configuration](*c)
+
 	if serverCommand.Happened() {
-		config := homecommon.GetConf[Configuration](*c)
 		streaming := false
 		pid := 0
 
@@ -163,11 +156,11 @@ func main() {
 
 		router := gin.Default()
 		router.Static("/", htmldir)
-		router.POST(config.Url, createStream(config, &streaming, &pid))
+		router.POST(config.Url, createStream(*c, config, &streaming, &pid))
 		router.DELETE(config.Url, deleteStream(&streaming, &pid))
 		router.Run(fmt.Sprintf("0.0.0.0:%d", config.Port))
 	} else if executeCommand.Happened() {
-		startExecuting(*v, *a, *s)
+		startExecuting(config, *v, *a, *s)
 	}
 }
 
@@ -184,8 +177,8 @@ func deleteStream(streaming *bool, pid *int) gin.HandlerFunc {
 	return fn
 }
 
-func executeSelfAsExecutor(videoSrc, audioSrc, sdpFileName string, pid chan int, answer chan string) int {
-	cmd := exec.Command(os.Args[0], "execute", "-v", videoSrc, "-a", audioSrc, "-s", sdpFileName)
+func executeSelfAsExecutor(configFile, videoSrc, audioSrc, sdpFileName string, pid chan int, answer chan string) int {
+	cmd := exec.Command(os.Args[0], "execute", "-c", configFile, "-v", videoSrc, "-a", audioSrc, "-s", sdpFileName)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -213,7 +206,7 @@ func executeSelfAsExecutor(videoSrc, audioSrc, sdpFileName string, pid chan int,
 
 	scanerr := bufio.NewScanner(stderr)
 	for scanerr.Scan() {
-		m := scanner.Text()
+		m := scanerr.Text()
 		log.Println(m)
 	}
 
@@ -228,7 +221,7 @@ func executeSelfAsExecutor(videoSrc, audioSrc, sdpFileName string, pid chan int,
 	return 0
 }
 
-func createStream(config *Configuration, streaming *bool, child *int) gin.HandlerFunc {
+func createStream(configFile string, config *Configuration, streaming *bool, child *int) gin.HandlerFunc {
 	fn := func(c *gin.Context) {
 		if *streaming {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, map[string]string{"message": "Service unavailable as streaming is in progress"})
@@ -267,7 +260,7 @@ func createStream(config *Configuration, streaming *bool, child *int) gin.Handle
 
 		go func() {
 			log.Println("About to execute streaming process")
-			code := executeSelfAsExecutor(videoSrc, audioSrc, sdpFileName, pid, answer)
+			code := executeSelfAsExecutor(configFile, videoSrc, audioSrc, sdpFileName, pid, answer)
 			log.Printf("Child process with PID: %d exited with code: %d", *child, code)
 			*streaming = false
 			*child = 0
@@ -314,44 +307,83 @@ func setupLogging(logFile string) *os.File {
 	return nil
 }
 
-func startExecuting(videoSrc, audioSrc, sdpFile string) {
+func startExecuting(conf *Configuration, videoSrc, audioSrc, sdpFile string) {
 	gst.Init(nil)
+
 	config := webrtc.Configuration{}
+	if conf.OpenRelayConfig != nil {
+		fmt.Println("Found Open Relay Config")
+		url := fmt.Sprintf("https://%s/api/v1/turn/credentials?apiKey=%s", conf.OpenRelayConfig.AppName, conf.OpenRelayConfig.ApiKey)
+		fmt.Printf("Url: %s\n", url)
+		response, err := http.Get(url)
+		if err != nil {
+			log.Fatalln(err)
+		}
+
+		responseData, err := io.ReadAll(response.Body)
+		if err != nil {
+			log.Fatalln(err)
+		}
+
+		var iceServers []ICEServer
+		if err := json.Unmarshal(responseData, &iceServers); err != nil {
+			log.Fatalln(err)
+		}
+
+		config.ICEServers = make([]webrtc.ICEServer, len(iceServers))
+		for i, iceServer := range iceServers {
+			config.ICEServers[i].URLs = make([]string, 1)
+			config.ICEServers[i].URLs[0] = iceServer.URLs
+			config.ICEServers[i].Username = iceServer.Username
+			config.ICEServers[i].Credential = iceServer.Credential
+			config.ICEServers[i].CredentialType = iceServer.CredentialType
+		}
+	} else if len(conf.IceServers) > 0 {
+		fmt.Println("Found ICE Servers")
+		config.ICEServers = conf.IceServers
+	} else {
+		fmt.Println("Using default Ice Servers")
+		config.ICEServers = make([]webrtc.ICEServer, 1)
+		config.ICEServers[0].URLs = make([]string, 1)
+		config.ICEServers[0].URLs[0] = "stun:stun.l.google.com:19302"
+	}
+
+	fmt.Printf("Webrtc config: %v\n", config)
 
 	peerConnection, err := webrtc.NewPeerConnection(config)
 	if err != nil {
-		panic(err)
+		log.Fatalln(err)
 	}
 
 	peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
 		fmt.Printf("Connection State has changed %s \n", connectionState.String())
 		if connectionState == webrtc.ICEConnectionStateFailed {
-			panic("Exiting as connection could not be established")
+			log.Fatalln("Exiting as connection could not be established")
 		}
 	})
 
 	audioTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: "audio/opus"}, "audio", "pion1")
 	if err != nil {
-		panic(err)
+		log.Fatalln(err)
 	}
 	_, err = peerConnection.AddTrack(audioTrack)
 	if err != nil {
-		panic(err)
+		log.Fatalln(err)
 	}
 
 	// Create a video track
 	firstVideoTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: "video/vp8"}, "video", "pion2")
 	if err != nil {
-		panic(err)
+		log.Fatalln(err)
 	}
 	_, err = peerConnection.AddTrack(firstVideoTrack)
 	if err != nil {
-		panic(err)
+		log.Fatalln(err)
 	}
 
 	buf, err := os.ReadFile(sdpFile)
 	if err != nil {
-		panic(err)
+		log.Fatalln(err)
 	}
 
 	offer := webrtc.SessionDescription{}
@@ -359,19 +391,19 @@ func startExecuting(videoSrc, audioSrc, sdpFile string) {
 
 	err = peerConnection.SetRemoteDescription(offer)
 	if err != nil {
-		panic(err)
+		log.Fatalln(err)
 	}
 
 	answer, err := peerConnection.CreateAnswer(nil)
 	if err != nil {
-		panic(err)
+		log.Fatalln(err)
 	}
 
 	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
 
 	err = peerConnection.SetLocalDescription(answer)
 	if err != nil {
-		panic(err)
+		log.Fatalln(err)
 	}
 
 	fmt.Println("Gathering candidates")
