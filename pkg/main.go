@@ -19,14 +19,17 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -36,8 +39,10 @@ import (
 	"github.com/go-gst/go-gst/gst"
 	"github.com/go-gst/go-gst/gst/app"
 	homecommon "github.com/homebackend/go-homebackend-common/pkg"
+	"github.com/pion/turn/v2"
 	"github.com/pion/webrtc/v3"
 	"github.com/pion/webrtc/v3/pkg/media"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -65,17 +70,33 @@ type ICEServer struct {
 	CredentialType webrtc.ICECredentialType `json:"credentialType,omitempty"`
 }
 
+type TurnUserConfiguration struct {
+	User     string `yaml:"user" validate:"required"`
+	Password string `yaml:"password" validate:"required"`
+}
+
+type TurnConfiguration struct {
+	PublicIp string                  `yaml:"public_ip" validate:"required"`
+	UdpPort  int                     `yaml:"port" validate:"required,number,gte=1,lte=65535" default:"8080"`
+	Users    []TurnUserConfiguration `yaml:"users" validate:"required"`
+	Realm    string                  `yaml:"realm" validate:"required"`
+	Threads  int                     `yaml:"threads" validate:"required,gte=1,lte=20"`
+}
+
 type Configuration struct {
-	Port            int                `yaml:"port" validate:"number,gte=1,lte=65535" default:"8080"`
-	Url             string             `yaml:"url" default:"/stream"`
-	ImageWidth      uint               `yaml:"image_width" default:"640"`
-	ImageHeight     uint               `yaml:"image_height" default:"480"`
-	FrameRate       uint               `yaml:"framerate" default:"30"`
-	LogFile         string             `yaml:"log_file" default:"none"`
-	AudioDevice     string             `yaml:"audio_device" validate:"required"`
-	VideoDevice     string             `yaml:"video_device" validate:"required"`
-	IceServers      []webrtc.ICEServer `yaml:"ice_servers,omitempty"`
-	OpenRelayConfig *OpenRelay         `yaml:"open_relay_config,omitempty"`
+	Port                  int                `yaml:"port" validate:"number,gte=1,lte=65535" default:"8080"`
+	Url                   string             `yaml:"url" default:"/stream"`
+	ImageWidth            uint               `yaml:"image_width" default:"640"`
+	ImageHeight           uint               `yaml:"image_height" default:"480"`
+	FrameRate             uint               `yaml:"framerate" default:"30"`
+	LogFile               string             `yaml:"log_file" default:"none"`
+	AudioDevice           string             `yaml:"audio_device" validate:"required"`
+	VideoDevice           string             `yaml:"video_device" validate:"required"`
+	DisconnectOnReconnect bool               `yaml:"disconnect_on_reconnect" default:"false"`
+	IceServers            []webrtc.ICEServer `yaml:"ice_servers,omitempty"`
+	OpenRelayConfig       *OpenRelay         `yaml:"open_relay_config,omitempty"`
+	UseInternalTurn       bool               `yaml:"use_internal_turn" default:"false"`
+	TurnConfiguration     *TurnConfiguration `yaml:"turn_configuration"`
 }
 
 // Encode encodes the input in base64
@@ -136,38 +157,121 @@ func main() {
 	config := homecommon.GetConf[Configuration](*c)
 
 	if serverCommand.Happened() {
-		streaming := false
-		pid := 0
-
-		f := setupLogging(config.LogFile)
-		if f != nil {
-			defer f.Close()
-		}
-
-		var htmldir string
-		if _, err := os.Stat("./html"); err == nil {
-			htmldir = "./html"
-		} else {
-			htmldir = "/usr/share/gowebrtc/html"
-		}
-
-		gin.DisableConsoleColor()
-		gin.DefaultWriter = log.Writer()
-
-		router := gin.Default()
-		router.Static("/", htmldir)
-		router.POST(config.Url, createStream(*c, config, &streaming, &pid))
-		router.DELETE(config.Url, deleteStream(&streaming, &pid))
-		router.Run(fmt.Sprintf("0.0.0.0:%d", config.Port))
+		setupRouter(c, config)
 	} else if executeCommand.Happened() {
 		startExecuting(config, *v, *a, *s)
 	}
 }
 
+func setupRouter(c *string, config *Configuration) {
+	streaming := false
+	pid := 0
+
+	f := setupLogging(config.LogFile)
+	if f != nil {
+		defer f.Close()
+	}
+
+	if config.UseInternalTurn {
+		if config.TurnConfiguration == nil {
+			log.Fatalln("Turn server is enabled but configuration not provided")
+		}
+
+		if len(config.TurnConfiguration.Users) == 0 {
+			log.Fatalln("At least one user needs to be provided for server")
+		}
+
+		go setupTurnServer(config)
+	}
+
+	var htmldir string
+	if _, err := os.Stat("./html"); err == nil {
+		htmldir = "./html"
+	} else {
+		htmldir = "/usr/share/gowebrtc/html"
+	}
+
+	gin.DisableConsoleColor()
+	gin.DefaultWriter = log.Writer()
+
+	router := gin.Default()
+	router.Static("/", htmldir)
+	router.POST(config.Url, createStream(*c, config, &streaming, &pid))
+	router.DELETE(config.Url, deleteStream(&streaming, &pid))
+	router.Run(fmt.Sprintf("0.0.0.0:%d", config.Port))
+}
+
+func setupTurnServer(config *Configuration) {
+	addr, err := net.ResolveUDPAddr("udp", "0.0.0.0:"+strconv.Itoa(config.TurnConfiguration.UdpPort))
+	if err != nil {
+		log.Fatalf("Failed to parse server address: %s", err)
+	}
+
+	usersMap := map[string][]byte{}
+	for _, userPassword := range config.TurnConfiguration.Users {
+		usersMap[userPassword.User] = turn.GenerateAuthKey(userPassword.User, config.TurnConfiguration.Realm, userPassword.Password)
+	}
+
+	listenerConfig := &net.ListenConfig{
+		Control: func(network, address string, conn syscall.RawConn) error {
+			var operr error
+			if err = conn.Control(func(fd uintptr) {
+				operr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+			}); err != nil {
+				return err
+			}
+
+			return operr
+		},
+	}
+
+	relayAddressGenerator := &turn.RelayAddressGeneratorStatic{
+		RelayAddress: net.ParseIP(config.TurnConfiguration.PublicIp),
+		Address:      "0.0.0.0",
+	}
+
+	packetConnConfigs := make([]turn.PacketConnConfig, config.TurnConfiguration.Threads)
+	for i := 0; i < config.TurnConfiguration.Threads; i++ {
+		log.Printf("Network: %s, address: %s\n", addr.Network(), addr.String())
+		conn, listErr := listenerConfig.ListenPacket(context.Background(), addr.Network(), addr.String())
+		if listErr != nil {
+			log.Fatalf("Failed to allocate UDP listener at %s:%s", addr.Network(), addr.String())
+		}
+
+		packetConnConfigs[i] = turn.PacketConnConfig{
+			PacketConn:            conn,
+			RelayAddressGenerator: relayAddressGenerator,
+		}
+
+		log.Printf("Server %d listening on %s\n", i, conn.LocalAddr().String())
+	}
+
+	s, err := turn.NewServer(turn.ServerConfig{
+		Realm: config.TurnConfiguration.Realm,
+		AuthHandler: func(username string, realm string, srcAddr net.Addr) ([]byte, bool) { // nolint: revive
+			if key, ok := usersMap[username]; ok {
+				return key, true
+			}
+			return nil, false
+		},
+		PacketConnConfigs: packetConnConfigs,
+	})
+	if err != nil {
+		log.Panicf("Failed to create TURN server: %s", err)
+	}
+
+	defer s.Close()
+	select {}
+}
+
+func killStream(pid *int) {
+	syscall.Kill(*pid, syscall.SIGINT)
+}
+
 func deleteStream(streaming *bool, pid *int) gin.HandlerFunc {
 	fn := func(c *gin.Context) {
 		if *streaming {
-			syscall.Kill(*pid, syscall.SIGINT)
+			killStream(pid)
 			*streaming = false
 		}
 
@@ -224,8 +328,14 @@ func executeSelfAsExecutor(configFile, videoSrc, audioSrc, sdpFileName string, p
 func createStream(configFile string, config *Configuration, streaming *bool, child *int) gin.HandlerFunc {
 	fn := func(c *gin.Context) {
 		if *streaming {
-			c.AbortWithStatusJSON(http.StatusInternalServerError, map[string]string{"message": "Service unavailable as streaming is in progress"})
-			return
+			if !config.DisconnectOnReconnect {
+				c.AbortWithStatusJSON(http.StatusInternalServerError, map[string]string{"message": "Service unavailable as streaming is in progress"})
+				return
+			}
+
+			killStream(child)
+			// Allow some time to let things settle down
+			time.Sleep(1 * time.Second)
 		}
 
 		*streaming = true
@@ -311,7 +421,20 @@ func startExecuting(conf *Configuration, videoSrc, audioSrc, sdpFile string) {
 	gst.Init(nil)
 
 	config := webrtc.Configuration{}
-	if conf.OpenRelayConfig != nil {
+	if conf.UseInternalTurn {
+		config.ICEServers = make([]webrtc.ICEServer, 2*len(conf.TurnConfiguration.Users))
+
+		for i, user := range conf.TurnConfiguration.Users {
+			config.ICEServers[2*i].URLs = make([]string, 1)
+			config.ICEServers[2*i].URLs[0] = fmt.Sprintf("stun:%s:%d", conf.TurnConfiguration.PublicIp, conf.TurnConfiguration.UdpPort)
+			config.ICEServers[2*i].Username = user.User
+			config.ICEServers[2*i].Credential = user.Password
+			config.ICEServers[2*i+1].URLs = make([]string, 1)
+			config.ICEServers[2*i+1].URLs[0] = fmt.Sprintf("turn:%s:%d", conf.TurnConfiguration.PublicIp, conf.TurnConfiguration.UdpPort)
+			config.ICEServers[2*i+1].Username = user.User
+			config.ICEServers[2*i+1].Credential = user.Password
+		}
+	} else if conf.OpenRelayConfig != nil {
 		fmt.Println("Found Open Relay Config")
 		url := fmt.Sprintf("https://%s/api/v1/turn/credentials?apiKey=%s", conf.OpenRelayConfig.AppName, conf.OpenRelayConfig.ApiKey)
 		fmt.Printf("Url: %s\n", url)
