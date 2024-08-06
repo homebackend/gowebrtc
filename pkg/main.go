@@ -257,7 +257,7 @@ func setupWebsocketServer(c *string, config *Configuration) {
 
 	// Serve the ./frontend directory at Route /
 	http.HandleFunc("/", serveHome)
-	http.HandleFunc("/ws", manager.serveWS)
+	http.HandleFunc(config.Url, manager.serveWS)
 
 	// Serve on port :8080, fudge yeah hardcoded port
 	var err error
