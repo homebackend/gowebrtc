@@ -16,6 +16,9 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Install dependencies
+      run: sudo apt-get -y install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libunwind-dev
+
     - name: Set up Go
       uses: actions/setup-go@v4
       with:
