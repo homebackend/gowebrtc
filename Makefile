@@ -1,7 +1,7 @@
 # builds service executable
 .PHONY: build
 build:
-	go build -x -v -o ./bin/gowebrtc pkg/main.go
+	go build -x -v -o ./bin/gowebrtc pkg/configuration.go pkg/client.go pkg/event.go pkg/main.go pkg/manager.go pkg/stream.go
 
 clean:
 	rm -rvf bin build

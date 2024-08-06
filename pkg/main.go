@@ -23,7 +23,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -36,19 +35,23 @@ import (
 
 	"github.com/akamensky/argparse"
 	"github.com/gin-gonic/gin"
-	"github.com/go-gst/go-gst/gst"
-	"github.com/go-gst/go-gst/gst/app"
 	homecommon "github.com/homebackend/go-homebackend-common/pkg"
 	"github.com/pion/turn/v2"
-	"github.com/pion/webrtc/v3"
-	"github.com/pion/webrtc/v3/pkg/media"
 	"golang.org/x/sys/unix"
 )
 
 const (
 	CONF_FILE = "/etc/gowebrtc/config.yaml"
 	ANSWER    = "Answer: "
+	CANDIDATE = "Candidate: "
+	EOF       = "::EOF::"
 )
+
+type StreamAnswerHandler func(string)
+
+type StreamCandidateHandler func(string)
+
+type StreamErrorHandler func(string)
 
 type Request struct {
 	SDP string `json:"sdp"`
@@ -56,47 +59,6 @@ type Request struct {
 
 type Response struct {
 	SDP string `json:"sdp"`
-}
-
-type OpenRelay struct {
-	AppName string `yaml:"app_name"`
-	ApiKey  string `yaml:"api_key"`
-}
-
-type ICEServer struct {
-	URLs           string                   `json:"urls"`
-	Username       string                   `json:"username,omitempty"`
-	Credential     interface{}              `json:"credential,omitempty"`
-	CredentialType webrtc.ICECredentialType `json:"credentialType,omitempty"`
-}
-
-type TurnUserConfiguration struct {
-	User     string `yaml:"user" validate:"required"`
-	Password string `yaml:"password" validate:"required"`
-}
-
-type TurnConfiguration struct {
-	PublicIp string                  `yaml:"public_ip" validate:"required"`
-	UdpPort  int                     `yaml:"port" validate:"required,number,gte=1,lte=65535" default:"8080"`
-	Users    []TurnUserConfiguration `yaml:"users" validate:"required"`
-	Realm    string                  `yaml:"realm" validate:"required"`
-	Threads  int                     `yaml:"threads" validate:"required,gte=1,lte=20"`
-}
-
-type Configuration struct {
-	Port                  int                `yaml:"port" validate:"number,gte=1,lte=65535" default:"8080"`
-	Url                   string             `yaml:"url" default:"/stream"`
-	ImageWidth            uint               `yaml:"image_width" default:"640"`
-	ImageHeight           uint               `yaml:"image_height" default:"480"`
-	FrameRate             uint               `yaml:"framerate" default:"30"`
-	LogFile               string             `yaml:"log_file" default:"none"`
-	AudioDevice           string             `yaml:"audio_device" validate:"required"`
-	VideoDevice           string             `yaml:"video_device" validate:"required"`
-	DisconnectOnReconnect bool               `yaml:"disconnect_on_reconnect" default:"false"`
-	IceServers            []webrtc.ICEServer `yaml:"ice_servers,omitempty"`
-	OpenRelayConfig       *OpenRelay         `yaml:"open_relay_config,omitempty"`
-	UseInternalTurn       bool               `yaml:"use_internal_turn" default:"false"`
-	TurnConfiguration     *TurnConfiguration `yaml:"turn_configuration"`
 }
 
 // Encode encodes the input in base64
@@ -133,6 +95,11 @@ func main() {
 		Help:     "Configuration File",
 	})
 
+	w := executeCommand.Flag("w", "wait", &argparse.Options{
+		Default: false,
+		Help:    "Wait for candidates before printing Answer",
+	})
+
 	a := executeCommand.String("a", "audio-pipeline", &argparse.Options{
 		Required: true,
 		Help:     "GStreamer audio pipeline to use",
@@ -157,20 +124,18 @@ func main() {
 	config := homecommon.GetConf[Configuration](*c)
 
 	if serverCommand.Happened() {
-		setupRouter(c, config)
+		if config.Signalling == "http" {
+			setupRouter(c, config)
+		} else if config.Signalling == "websocket" {
+			setupWebsocketServer(c, config)
+		}
 	} else if executeCommand.Happened() {
-		startExecuting(config, *v, *a, *s)
+		StartStreaming(config, *v, *a, *s, *w)
 	}
 }
 
-func setupRouter(c *string, config *Configuration) {
-	streaming := false
-	pid := 0
-
+func setupCommon(config *Configuration) *os.File {
 	f := setupLogging(config.LogFile)
-	if f != nil {
-		defer f.Close()
-	}
 
 	if config.UseInternalTurn {
 		if config.TurnConfiguration == nil {
@@ -183,6 +148,18 @@ func setupRouter(c *string, config *Configuration) {
 
 		go setupTurnServer(config)
 	}
+
+	return f
+}
+
+func setupRouter(c *string, config *Configuration) {
+	f := setupCommon(config)
+	if f != nil {
+		defer f.Close()
+	}
+
+	streaming := false
+	pid := 0
 
 	var htmldir string
 	if _, err := os.Stat("./html"); err == nil {
@@ -264,6 +241,51 @@ func setupTurnServer(config *Configuration) {
 	select {}
 }
 
+func setupWebsocketServer(c *string, config *Configuration) {
+	f := setupCommon(config)
+	if f != nil {
+		defer f.Close()
+	}
+
+	rootCtx := context.Background()
+	ctx, cancel := context.WithCancel(rootCtx)
+
+	defer cancel()
+
+	manager := NewManager(ctx, *c, config)
+	go manager.processConnection()
+
+	// Serve the ./frontend directory at Route /
+	http.HandleFunc("/", serveHome)
+	http.HandleFunc("/ws", manager.serveWS)
+
+	// Serve on port :8080, fudge yeah hardcoded port
+	var err error
+	addr := fmt.Sprintf("0.0.0.0:%d", config.Port)
+	log.Printf("WS Address: %s\n", addr)
+	if config.SignallingUsesTls {
+		err = http.ListenAndServeTLS(addr, config.SignallingTlsCert, config.SignallingTlsKey, nil)
+	} else {
+		err = http.ListenAndServe(addr, nil)
+	}
+	if err != nil {
+		log.Fatal("ListenAndServe: ", err)
+	}
+}
+
+func serveHome(w http.ResponseWriter, r *http.Request) {
+	log.Println(r.URL)
+	if r.URL.Path != "/" {
+		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	http.ServeFile(w, r, "home.html")
+}
+
 func killStream(pid *int) {
 	syscall.Kill(*pid, syscall.SIGINT)
 }
@@ -281,8 +303,13 @@ func deleteStream(streaming *bool, pid *int) gin.HandlerFunc {
 	return fn
 }
 
-func executeSelfAsExecutor(configFile, videoSrc, audioSrc, sdpFileName string, pid chan int, answer chan string) int {
-	cmd := exec.Command(os.Args[0], "execute", "-c", configFile, "-v", videoSrc, "-a", audioSrc, "-s", sdpFileName)
+func executeSelfAsExecutor(wait bool, configFile, videoSrc, audioSrc, sdpFileName string, pid chan int, answer chan string, candidate chan string, end chan bool) int {
+	var cmd *exec.Cmd
+	if wait {
+		cmd = exec.Command(os.Args[0], "execute", "-c", configFile, "-v", videoSrc, "-a", audioSrc, "-s", sdpFileName, "-w")
+	} else {
+		cmd = exec.Command(os.Args[0], "execute", "-c", configFile, "-v", videoSrc, "-a", audioSrc, "-s", sdpFileName)
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -296,23 +323,33 @@ func executeSelfAsExecutor(configFile, videoSrc, audioSrc, sdpFileName string, p
 	cmd.Start()
 	pid <- cmd.Process.Pid
 
-	scanner := bufio.NewScanner(stdout)
-	for scanner.Scan() {
-		m := scanner.Text()
-		if strings.HasPrefix(m, "Answer: ") {
-			answerText := m[len(ANSWER):]
-			log.Printf("Answer found to be %s", answerText)
-			answer <- answerText
-		} else {
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			m := scanner.Text()
+			if strings.HasPrefix(m, ANSWER) {
+				answerText := m[len(ANSWER):]
+				log.Printf("Answer found to be %s", answerText)
+				answer <- answerText
+			} else if strings.HasPrefix(m, CANDIDATE) {
+				candidateText := m[len(CANDIDATE):]
+				log.Printf("Candidate found to be %s", candidateText)
+				candidate <- candidateText
+			} else if strings.HasPrefix(m, EOF) {
+				end <- true
+			} else {
+				log.Println(m)
+			}
+		}
+	}()
+
+	go func() {
+		scanerr := bufio.NewScanner(stderr)
+		for scanerr.Scan() {
+			m := scanerr.Text()
 			log.Println(m)
 		}
-	}
-
-	scanerr := bufio.NewScanner(stderr)
-	for scanerr.Scan() {
-		m := scanerr.Text()
-		log.Println(m)
-	}
+	}()
 
 	if err := cmd.Wait(); err != nil {
 		if exiterr, ok := err.(*exec.ExitError); ok {
@@ -325,78 +362,95 @@ func executeSelfAsExecutor(configFile, videoSrc, audioSrc, sdpFileName string, p
 	return 0
 }
 
-func createStream(configFile string, config *Configuration, streaming *bool, child *int) gin.HandlerFunc {
-	fn := func(c *gin.Context) {
-		if *streaming {
-			if !config.DisconnectOnReconnect {
-				c.AbortWithStatusJSON(http.StatusInternalServerError, map[string]string{"message": "Service unavailable as streaming is in progress"})
-				return
-			}
-
-			killStream(child)
-			// Allow some time to let things settle down
-			time.Sleep(1 * time.Second)
+func HandleStreamingRequest(configFile string, config *Configuration, streaming *bool, child *int, sdp string,
+	answerHandler StreamAnswerHandler, candidateHandler StreamCandidateHandler, errorHandler StreamErrorHandler) {
+	if *streaming {
+		if !config.DisconnectOnReconnect {
+			errorHandler("Service unavailable as streaming is in progress")
+			return
 		}
 
-		*streaming = true
+		killStream(child)
+		// Allow some time to let things settle down
+		time.Sleep(1 * time.Second)
+	}
 
+	*streaming = true
+
+	videoSrc := fmt.Sprintf("%s ! video/x-raw, width=%d, height=%d, framerate=%d/1 ! videoconvert ! queue", config.VideoDevice, config.ImageWidth, config.ImageHeight, config.FrameRate)
+	audioSrc := fmt.Sprintf("%s ! audioconvert ! queue", config.AudioDevice)
+
+	log.Println(videoSrc)
+	log.Println(audioSrc)
+
+	file, err := os.CreateTemp("/tmp", "gowebrtc")
+	if err != nil {
+		log.Println(err)
+		errorHandler("Unable to create sdp file")
+		return
+	}
+	sdpFileName := file.Name()
+	defer os.Remove(sdpFileName)
+
+	file.WriteString(sdp)
+	file.Close()
+
+	answer := make(chan string)
+	candidate := make(chan string)
+	end := make(chan bool)
+	pid := make(chan int)
+	failure := make(chan int)
+
+	go func() {
+		log.Println("About to execute streaming process")
+		code := executeSelfAsExecutor(config.IceTrickling, configFile, videoSrc, audioSrc, sdpFileName, pid, answer, candidate, end)
+		log.Printf("Child process with PID: %d exited with code: %d", *child, code)
+		*streaming = false
+		*child = 0
+		failure <- code
+	}()
+
+	for {
+		select {
+		case s := <-answer:
+			log.Println("Got result")
+			answerHandler(s)
+			log.Println("Sent response")
+		case c := <-candidate:
+			candidateHandler(c)
+		case <-end:
+			return
+		case code := <-failure:
+			log.Println("Got error while starting streaming")
+			errorHandler(fmt.Sprintf("Error while creating stream: %d", code))
+			return
+		case p := <-pid:
+			log.Printf("Started process with pid: %d", p)
+			*child = p
+			break
+		}
+	}
+}
+
+func createStream(configFile string, config *Configuration, streaming *bool, child *int) gin.HandlerFunc {
+	fn := func(c *gin.Context) {
 		var request Request
 		if err := c.BindJSON(&request); err != nil {
 			log.Println(err)
 			return
 		}
 
-		videoSrc := fmt.Sprintf("%s ! video/x-raw, width=%d, height=%d, framerate=%d/1 ! videoconvert ! queue", config.VideoDevice, config.ImageWidth, config.ImageHeight, config.FrameRate)
-		audioSrc := fmt.Sprintf("%s ! audioconvert ! queue", config.AudioDevice)
+		HandleStreamingRequest(configFile, config, streaming, child, request.SDP, func(s string) {
+			var response Response
+			log.Println("Got result")
+			response.SDP = s
+			c.IndentedJSON(http.StatusOK, response)
+			log.Println("Sent response")
+		}, func(string) {
 
-		log.Println(videoSrc)
-		log.Println(audioSrc)
-
-		file, err := os.CreateTemp("/tmp", "gowebrtc")
-		if err != nil {
-			log.Println(err)
-			c.IndentedJSON(http.StatusInternalServerError, map[string]string{"message": "Unable to create sdp file"})
-		}
-		sdpFileName := file.Name()
-		defer os.Remove(sdpFileName)
-
-		file.WriteString(request.SDP)
-		file.Close()
-
-		var response Response
-		answer := make(chan string)
-		pid := make(chan int)
-		failure := make(chan int)
-
-		go func() {
-			log.Println("About to execute streaming process")
-			code := executeSelfAsExecutor(configFile, videoSrc, audioSrc, sdpFileName, pid, answer)
-			log.Printf("Child process with PID: %d exited with code: %d", *child, code)
-			*streaming = false
-			*child = 0
-			failure <- code
-		}()
-
-		for {
-			select {
-			case s := <-answer:
-				log.Println("Got result")
-				response.SDP = s
-				c.IndentedJSON(http.StatusOK, response)
-				log.Println("Sent response")
-				return
-			case code := <-failure:
-				log.Println("Got error while starting streaming")
-				c.IndentedJSON(http.StatusInternalServerError, map[string]string{"message": fmt.Sprintf("Error while creating stream: %d", code)})
-				return
-			case p := <-pid:
-				log.Printf("Started process with pid: %d", p)
-				*child = p
-				break
-			default:
-				time.Sleep(100 * time.Millisecond)
-			}
-		}
+		}, func(e string) {
+			c.IndentedJSON(http.StatusInternalServerError, map[string]string{"message": e})
+		})
 	}
 
 	return fn
@@ -406,7 +460,7 @@ func setupLogging(logFile string) *os.File {
 	if logFile != "none" {
 		f, err := os.OpenFile(logFile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 		if err != nil {
-			log.Fatalf("Error opening file: %v", err)
+			panic(fmt.Sprintf("Error opening file: %v", err))
 		}
 
 		log.SetOutput(f)
@@ -415,189 +469,4 @@ func setupLogging(logFile string) *os.File {
 	}
 
 	return nil
-}
-
-func startExecuting(conf *Configuration, videoSrc, audioSrc, sdpFile string) {
-	gst.Init(nil)
-
-	config := webrtc.Configuration{}
-	if conf.UseInternalTurn {
-		config.ICEServers = make([]webrtc.ICEServer, 2*len(conf.TurnConfiguration.Users))
-
-		for i, user := range conf.TurnConfiguration.Users {
-			config.ICEServers[2*i].URLs = make([]string, 1)
-			config.ICEServers[2*i].URLs[0] = fmt.Sprintf("stun:%s:%d", conf.TurnConfiguration.PublicIp, conf.TurnConfiguration.UdpPort)
-			config.ICEServers[2*i].Username = user.User
-			config.ICEServers[2*i].Credential = user.Password
-			config.ICEServers[2*i+1].URLs = make([]string, 1)
-			config.ICEServers[2*i+1].URLs[0] = fmt.Sprintf("turn:%s:%d", conf.TurnConfiguration.PublicIp, conf.TurnConfiguration.UdpPort)
-			config.ICEServers[2*i+1].Username = user.User
-			config.ICEServers[2*i+1].Credential = user.Password
-		}
-	} else if conf.OpenRelayConfig != nil {
-		fmt.Println("Found Open Relay Config")
-		url := fmt.Sprintf("https://%s/api/v1/turn/credentials?apiKey=%s", conf.OpenRelayConfig.AppName, conf.OpenRelayConfig.ApiKey)
-		fmt.Printf("Url: %s\n", url)
-		response, err := http.Get(url)
-		if err != nil {
-			log.Fatalln(err)
-		}
-
-		responseData, err := io.ReadAll(response.Body)
-		if err != nil {
-			log.Fatalln(err)
-		}
-
-		var iceServers []ICEServer
-		if err := json.Unmarshal(responseData, &iceServers); err != nil {
-			log.Fatalln(err)
-		}
-
-		config.ICEServers = make([]webrtc.ICEServer, len(iceServers))
-		for i, iceServer := range iceServers {
-			config.ICEServers[i].URLs = make([]string, 1)
-			config.ICEServers[i].URLs[0] = iceServer.URLs
-			config.ICEServers[i].Username = iceServer.Username
-			config.ICEServers[i].Credential = iceServer.Credential
-			config.ICEServers[i].CredentialType = iceServer.CredentialType
-		}
-	} else if len(conf.IceServers) > 0 {
-		fmt.Println("Found ICE Servers")
-		config.ICEServers = conf.IceServers
-	} else {
-		fmt.Println("Using default Ice Servers")
-		config.ICEServers = make([]webrtc.ICEServer, 1)
-		config.ICEServers[0].URLs = make([]string, 1)
-		config.ICEServers[0].URLs[0] = "stun:stun.l.google.com:19302"
-	}
-
-	fmt.Printf("Webrtc config: %v\n", config)
-
-	peerConnection, err := webrtc.NewPeerConnection(config)
-	if err != nil {
-		log.Fatalln(err)
-	}
-
-	peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
-		fmt.Printf("Connection State has changed %s \n", connectionState.String())
-		if connectionState == webrtc.ICEConnectionStateFailed {
-			log.Fatalln("Exiting as connection could not be established")
-		}
-	})
-
-	audioTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: "audio/opus"}, "audio", "pion1")
-	if err != nil {
-		log.Fatalln(err)
-	}
-	_, err = peerConnection.AddTrack(audioTrack)
-	if err != nil {
-		log.Fatalln(err)
-	}
-
-	// Create a video track
-	firstVideoTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: "video/vp8"}, "video", "pion2")
-	if err != nil {
-		log.Fatalln(err)
-	}
-	_, err = peerConnection.AddTrack(firstVideoTrack)
-	if err != nil {
-		log.Fatalln(err)
-	}
-
-	buf, err := os.ReadFile(sdpFile)
-	if err != nil {
-		log.Fatalln(err)
-	}
-
-	offer := webrtc.SessionDescription{}
-	decode(string(buf), &offer)
-
-	err = peerConnection.SetRemoteDescription(offer)
-	if err != nil {
-		log.Fatalln(err)
-	}
-
-	answer, err := peerConnection.CreateAnswer(nil)
-	if err != nil {
-		log.Fatalln(err)
-	}
-
-	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
-
-	err = peerConnection.SetLocalDescription(answer)
-	if err != nil {
-		log.Fatalln(err)
-	}
-
-	fmt.Println("Gathering candidates")
-	<-gatherComplete
-
-	localDescription := encode(*peerConnection.LocalDescription())
-	fmt.Println(ANSWER + localDescription)
-
-	pipelineForCodec("opus", []*webrtc.TrackLocalStaticSample{audioTrack}, audioSrc)
-	pipelineForCodec("vp8", []*webrtc.TrackLocalStaticSample{firstVideoTrack}, videoSrc)
-
-	select {}
-}
-
-// Create the appropriate GStreamer pipeline depending on what codec we are working with
-func pipelineForCodec(codecName string, tracks []*webrtc.TrackLocalStaticSample, pipelineSrc string) {
-	pipelineStr := "appsink name=appsink"
-	switch codecName {
-	case "vp8":
-		pipelineStr = pipelineSrc + " ! vp8enc error-resilient=partitions keyframe-max-dist=10 auto-alt-ref=true cpu-used=5 deadline=1 ! " + pipelineStr
-	case "vp9":
-		pipelineStr = pipelineSrc + " ! vp9enc ! " + pipelineStr
-	case "h264":
-		pipelineStr = pipelineSrc + " ! video/x-raw,format=I420 ! x264enc speed-preset=ultrafast tune=zerolatency key-int-max=20 ! video/x-h264,stream-format=byte-stream ! " + pipelineStr
-	case "opus":
-		pipelineStr = pipelineSrc + " ! opusenc ! " + pipelineStr
-	case "pcmu":
-		pipelineStr = pipelineSrc + " ! audio/x-raw, rate=8000 ! mulawenc ! " + pipelineStr
-	case "pcma":
-		pipelineStr = pipelineSrc + " ! audio/x-raw, rate=8000 ! alawenc ! " + pipelineStr
-	default:
-		log.Fatalln("Unhandled codec " + codecName) //nolint
-	}
-
-	log.Println(pipelineStr)
-	pipeline, err := gst.NewPipelineFromString(pipelineStr)
-	if err != nil {
-		log.Fatalln(err)
-	}
-
-	if err = pipeline.SetState(gst.StatePlaying); err != nil {
-		log.Fatalln(err)
-	}
-
-	appSink, err := pipeline.GetElementByName("appsink")
-	if err != nil {
-		log.Fatalln(err)
-	}
-
-	app.SinkFromElement(appSink).SetCallbacks(&app.SinkCallbacks{
-		NewSampleFunc: func(sink *app.Sink) gst.FlowReturn {
-			sample := sink.PullSample()
-			if sample == nil {
-				return gst.FlowEOS
-			}
-
-			buffer := sample.GetBuffer()
-			if buffer == nil {
-				return gst.FlowError
-			}
-
-			samples := buffer.Map(gst.MapRead).Bytes()
-			defer buffer.Unmap()
-
-			for _, t := range tracks {
-				if err := t.WriteSample(media.Sample{Data: samples, Duration: *buffer.Duration().AsDuration()}); err != nil {
-					log.Fatalln(err) //nolint
-				}
-			}
-
-			return gst.FlowOK
-		},
-	})
 }
