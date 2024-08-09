@@ -12,7 +12,7 @@ debian: build
 		build/debian/gowebrtc/etc/gowebrtc/ \
 		build/debian/gowebrtc/lib/systemd/system \
 		build/debian/gowebrtc/usr/share/gowebrtc
-	cp -v config/config.yaml.sample build/debian/gowebrtc/etc/gowebrtc
+	cp -v config/config.yaml build/debian/gowebrtc/etc/gowebrtc
 	cp -v bin/gowebrtc build/debian/gowebrtc/usr/local/bin
 	cp -v gowebrtc.service build/debian/gowebrtc/lib/systemd/system
 	cp -av html build/debian/gowebrtc/usr/share/gowebrtc

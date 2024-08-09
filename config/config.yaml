@@ -1,0 +1,22 @@
+port: 8082
+url: /ws
+image_width: 640
+image_height: 480
+framerate: 30
+log_file: /var/log/gowebrtc.log
+audio_device: alsasrc device=plughw:CARD=I930,DEV=0
+video_device: autovideosrc
+signalling: websocket
+signalling_credentials:
+  - user: username
+    password: password
+disconnect_on_reconnect: true
+use_internal_turn: true
+turn_configuration:
+  public_ip: 1.2.3.4
+  port: 8084
+  threads: 4
+  users:
+    - user: username
+      password: password
+
