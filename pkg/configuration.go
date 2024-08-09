@@ -40,7 +40,7 @@ type TurnConfiguration struct {
 	PublicIp string            `yaml:"public_ip" validate:"required"`
 	UdpPort  int               `yaml:"port" validate:"required,number,gte=1,lte=65535" default:"8080"`
 	Users    []UserCredentials `yaml:"users" validate:"required"`
-	Realm    string            `yaml:"realm" validate:"required"`
+	Realm    string            `yaml:"realm" default:"default"`
 	Threads  int               `yaml:"threads" validate:"required,gte=1,lte=20"`
 }
 
