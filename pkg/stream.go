@@ -27,6 +27,7 @@ import (
 
 	"github.com/go-gst/go-gst/gst"
 	"github.com/go-gst/go-gst/gst/app"
+	"github.com/pion/interceptor"
 	"github.com/pion/webrtc/v3"
 	"github.com/pion/webrtc/v3/pkg/media"
 )
@@ -38,20 +39,42 @@ func StartStreaming(conf *Configuration, videoSrc, audioSrc, sdpFile string, wai
 	startExecuting(conf, videoSrc, audioSrc, sdpFile, wait)
 }
 
-func getWebrtcConfiguration(conf *Configuration) webrtc.Configuration {
+func getWebrtcPeerConfiguration(conf *Configuration) (*webrtc.PeerConnection, error) {
 	config := webrtc.Configuration{}
 	if conf.UseInternalTurn {
-		config.ICEServers = make([]webrtc.ICEServer, 2*len(conf.TurnConfiguration.Users))
+		if conf.TurnConfiguration.TurnType == TurnInternal {
+			config.ICEServers = make([]webrtc.ICEServer, 2*len(conf.TurnConfiguration.Users))
 
-		for i, user := range conf.TurnConfiguration.Users {
-			config.ICEServers[2*i].URLs = make([]string, 1)
-			config.ICEServers[2*i].URLs[0] = fmt.Sprintf("stun:%s:%d", "127.0.0.1", conf.TurnConfiguration.UdpPort)
-			config.ICEServers[2*i].Username = user.User
-			config.ICEServers[2*i].Credential = user.Password
-			config.ICEServers[2*i+1].URLs = make([]string, 1)
-			config.ICEServers[2*i+1].URLs[0] = fmt.Sprintf("turn:%s:%d", "127.0.0.1", conf.TurnConfiguration.UdpPort)
-			config.ICEServers[2*i+1].Username = user.User
-			config.ICEServers[2*i+1].Credential = user.Password
+			for i, user := range conf.TurnConfiguration.Users {
+				config.ICEServers[2*i].URLs = make([]string, 1)
+				config.ICEServers[2*i].URLs[0] = fmt.Sprintf("stun:%s:%d", "127.0.0.1", conf.TurnConfiguration.UdpPort)
+				config.ICEServers[2*i].Username = user.User
+				config.ICEServers[2*i].Credential = user.Password
+				config.ICEServers[2*i+1].URLs = make([]string, 1)
+				config.ICEServers[2*i+1].URLs[0] = fmt.Sprintf("turn:%s:%d", "127.0.0.1", conf.TurnConfiguration.UdpPort)
+				config.ICEServers[2*i+1].Username = user.User
+				config.ICEServers[2*i+1].Credential = user.Password
+			}
+		} else {
+			m := &webrtc.MediaEngine{}
+			if err := m.RegisterDefaultCodecs(); err != nil {
+				return nil, err
+			}
+
+			i := &interceptor.Registry{}
+			if err := webrtc.RegisterDefaultInterceptors(m, i); err != nil {
+				return nil, err
+			}
+
+			s := webrtc.SettingEngine{}
+			s.SetNAT1To1IPs([]string{conf.TurnConfiguration.PublicIp}, webrtc.ICECandidateTypeSrflx)
+
+			config.ICEServers = make([]webrtc.ICEServer, 1)
+			config.ICEServers[0].URLs = make([]string, 1)
+			config.ICEServers[0].URLs[0] = "stun:stun.l.google.com:19302"
+
+			api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(i), webrtc.WithSettingEngine(s))
+			return api.NewPeerConnection(config)
 		}
 	} else if conf.OpenRelayConfig != nil {
 		fmt.Println("Found Open Relay Config")
@@ -90,7 +113,8 @@ func getWebrtcConfiguration(conf *Configuration) webrtc.Configuration {
 		config.ICEServers[0].URLs[0] = "stun:stun.l.google.com:19302"
 	}
 
-	return config
+	fmt.Printf("Webrtc config: %v\n", config)
+	return webrtc.NewPeerConnection(config)
 }
 
 func printAnswer(answer webrtc.SessionDescription) {
@@ -101,10 +125,7 @@ func printAnswer(answer webrtc.SessionDescription) {
 func startExecuting(conf *Configuration, videoSrc, audioSrc, sdpFile string, wait bool) {
 	gst.Init(nil)
 
-	config := getWebrtcConfiguration(conf)
-	fmt.Printf("Webrtc config: %v\n", config)
-
-	peerConnection, err := webrtc.NewPeerConnection(config)
+	peerConnection, err := getWebrtcPeerConfiguration(conf)
 	if err != nil {
 		log.Fatalln(err)
 	}

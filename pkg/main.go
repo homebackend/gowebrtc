@@ -146,7 +146,9 @@ func setupCommon(config *Configuration) *os.File {
 			log.Fatalln("At least one user needs to be provided for server")
 		}
 
-		go setupTurnServer(config)
+		if config.TurnConfiguration.TurnType == TurnInternal {
+			go setupTurnServer(config)
+		}
 	}
 
 	return f

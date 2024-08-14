@@ -19,6 +19,11 @@ package main
 
 import "github.com/pion/webrtc/v3"
 
+const (
+	TurnInternal = "internal"
+	TurnPublicIp = "ip"
+)
+
 type OpenRelay struct {
 	AppName string `yaml:"app_name"`
 	ApiKey  string `yaml:"api_key"`
@@ -37,6 +42,7 @@ type UserCredentials struct {
 }
 
 type TurnConfiguration struct {
+	TurnType string            `yaml:"type" validate:"oneof=ip internal" default:"ip"`
 	PublicIp string            `yaml:"public_ip" validate:"required"`
 	UdpPort  int               `yaml:"port" validate:"required,number,gte=1,lte=65535" default:"8080"`
 	Users    []UserCredentials `yaml:"users" validate:"required"`
